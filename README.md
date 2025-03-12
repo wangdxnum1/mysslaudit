@@ -38,6 +38,18 @@ sudo ./mysslaudit
 ./httpserver  
 ```
 
+3.使用浏览器,curl,或者wget访问curl https://192.168.99.249:8443/
+
+```shell
+wget https://192.168.99.249:8443/ --no-check-certificate
+```
+
+
+
+```shell
+curl https://192.168.99.249:8443/ -k
+```
+
 3.观察sudo ./mysslaudit 程序输出
 
 ## 已测试平台
