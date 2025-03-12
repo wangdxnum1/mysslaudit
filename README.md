@@ -6,6 +6,7 @@ Decrypt the content of SSL based on eBPF and obtain the IP information of the cl
 
 ## 编译步骤
 eBPF 相关的编译环境及开发框架可参照此教程：https://eunomia.dev/zh/tutorials/
+
 1.编译https测试代码
 
 ```shell
@@ -23,9 +24,19 @@ make
 
 
 ## 测试运行
-1.sudo ./mysslaudit  
+1.
 
-2../httpserver  
+```shell
+sudo ./mysslaudit 
+```
+
+ 
+
+2.
+
+```shell
+./httpserver  
+```
 
 3.观察sudo ./mysslaudit 程序输出
 
