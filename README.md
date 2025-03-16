@@ -30,13 +30,13 @@ make
 sudo ./mysslaudit 
 ```
 
- 
-
 2.
 
 ```shell
 ./httpserver  
 ```
+
+![myhttpserver](.\image\myhttpserver.png)
 
 3.使用浏览器,curl,或者wget访问curl https://192.168.99.249:8443/
 
@@ -44,13 +44,13 @@ sudo ./mysslaudit
 wget https://192.168.99.249:8443/ --no-check-certificate
 ```
 
-
-
 ```shell
 curl https://192.168.99.249:8443/ -k
 ```
 
-3.观察sudo ./mysslaudit 程序输出
+3.观察sudo ./mysslaudit 程序输出,可以看到已经捕获客户端地址信息，以及https请求和响应的内容。
+
+![mysslaudit](.\image\mysslaudit.png)
 
 ## 已测试平台
 1.深度系统 deepin 23
@@ -60,4 +60,4 @@ curl https://192.168.99.249:8443/ -k
 
 2.适配更多linux发行版本  
 
-3.更加动态化，支持https server，或者数据库服务器  
+3.更加动态化，支持和捕获数据库的流量  
