@@ -17,6 +17,10 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 
+#include <dirent.h>
+#include <fcntl.h>
+
+
 #include "mysslaudit.skel.h"
 #include "mysslaudit.h"
 
@@ -89,6 +93,7 @@ struct env {
 	bool latency;
 	bool handshake;
 	char *extra_lib;
+	bool mysql;
 } env = {
 	.uid = INVALID_UID,
 	.pid = INVALID_PID,
@@ -96,6 +101,7 @@ struct env {
 	.gnutls = true,
 	.nss = true,
 	.comm = NULL,
+	.mysql = true,
 };
 
 #define HEXDUMP_KEY 1000
@@ -234,6 +240,24 @@ int attach_nss(struct mysslaudit_bpf *skel, const char *lib) {
 	return 0;
 }
 
+int attach_mysql_openssl(struct mysslaudit_bpf *skel, const char *lib) {
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_write, probe_SSL_write_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_write, probe_SSL_write_exit);
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_read, probe_SSL_read_enter);
+	ATTACH_URETPROBE_CHECKED(skel, lib, SSL_read, probe_SSL_read_exit);
+
+	ATTACH_UPROBE_CHECKED(skel, lib, SSL_set_fd, probe_SSL_set_fd_enter);
+
+	if (env.latency && env.handshake) {
+		// ATTACH_UPROBE_CHECKED(skel, lib, SSL_do_handshake,
+		// 					probe_SSL_do_handshake_enter);
+		// ATTACH_URETPROBE_CHECKED(skel, lib, SSL_do_handshake,
+		// 						probe_SSL_do_handshake_exit);
+	}
+
+	return 0;
+}
+
 int attach_glibc_accept(struct mysslaudit_bpf *skel, const char *lib)
 {
     // 附加到glibc的accept函数
@@ -346,6 +370,177 @@ char *find_library_path2(const char *libname) {
     return path[0] ? path : NULL;
 }
 
+//
+// mysql 3306
+//
+// 函数用于查找指定端口的监听进程的 PID
+pid_t find_pid_by_port(int port) {
+    DIR *dir;
+    struct dirent *entry;
+    char path[1024];
+    FILE *fp;
+    char line[1024];
+    char local_addr[16];
+    int local_port;
+    char state[3];
+    char inode[16];
+
+    // 先收集所有监听指定端口的 inode
+    char target_inodes[100][16];
+    int target_inode_count = 0;
+
+    // 遍历 /proc/net/tcp 文件
+    if ((fp = fopen("/proc/net/tcp", "r")) == NULL) {
+        perror("fopen /proc/net/tcp");
+        return -1;
+    }
+
+    // 跳过第一行标题
+    fgets(line, sizeof(line), fp);
+
+    // 逐行读取文件内容
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        if (sscanf(line, "%*d: %15[^:]:%x %*[^ ] %2s %*[^ ] %*[^ ] %*[^ ] %*[^ ] %*[^ ] %15s", local_addr, &local_port, state, inode) == 4) {
+            if (local_port == port && strcmp(state, "0A") == 0) {
+                strcpy(target_inodes[target_inode_count], inode);
+                target_inode_count++;
+            }
+        }
+    }
+    fclose(fp);
+
+    // 没有找到监听指定端口的 inode
+    if (target_inode_count == 0) {
+        return -1;
+    }
+
+    // 打开 /proc 目录
+    if ((dir = opendir("/proc")) == NULL) {
+        perror("opendir");
+        return -1;
+    }
+
+    // 遍历 /proc 目录下的所有进程目录
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR && strspn(entry->d_name, "0123456789") == strlen(entry->d_name)) {
+            // 构建 /proc/<pid>/fd 目录路径
+            snprintf(path, sizeof(path), "/proc/%s/fd", entry->d_name);
+            DIR *fd_dir = opendir(path);
+            if (fd_dir != NULL) {
+                struct dirent *fd_entry;
+                while ((fd_entry = readdir(fd_dir)) != NULL) {
+                    if (fd_entry->d_type == DT_LNK) {
+                        // 构建 /proc/<pid>/fd/<fd> 符号链接路径
+                        snprintf(path, sizeof(path), "/proc/%s/fd/%s", entry->d_name, fd_entry->d_name);
+                        char link_target[1024];
+                        ssize_t len = readlink(path, link_target, sizeof(link_target) - 1);
+                        if (len != -1) {
+                            link_target[len] = '\0';
+                            for (int i = 0; i < target_inode_count; i++) {
+                                if (strstr(link_target, target_inodes[i]) != NULL) {
+                                    closedir(fd_dir);
+                                    closedir(dir);
+                                    return atoi(entry->d_name);
+                                }
+                            }
+                        }
+                    }
+                }
+                closedir(fd_dir);
+            }
+        }
+    }
+    closedir(dir);
+    return -1;
+}
+
+// 函数用于获取指定 PID 进程的全路径
+char *get_process_path(pid_t pid) {
+    char path[1024];
+    char *process_path = NULL;
+    ssize_t len;
+
+    // 构建 /proc/<pid>/exe 符号链接路径
+    snprintf(path, sizeof(path), "/proc/%d/exe", pid);
+
+    // 读取符号链接指向的路径
+	char buf[PATH_MAX];
+    len = readlink(path, buf, sizeof(buf) - 1);
+    if (len != -1) {
+        buf[len] = '\0';
+        process_path = strdup(buf);
+    }
+    return process_path;
+}
+
+void find_openssl_libs(const char *program_path, char* libpath, int len) {
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd), "LD_TRACE_LOADED_OBJECTS=1 \"%s\" 2>/dev/null", program_path);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        perror("Failed to trace library dependencies");
+        return;
+    }
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        // 解析两种格式：
+        // 1. libssl.so.3 => /usr/lib/libssl.so.3 (0x00007f8c1a200000)
+        // 2. linux-vdso.so.1 (0x00007ffd31bdf000)
+        
+        char *arrow = strstr(line, "=> ");
+        if (arrow) {  // 处理动态链接库
+            arrow += 3;
+            char *end = strchr(arrow, ' ');
+            if (!end) end = strchr(arrow, '(');
+            if (end) *end = '\0';
+            
+            // || strstr(arrow, "libcrypto.so")
+            if (strstr(arrow, "libssl.so")) {
+                //printf("OpenSSL动态库路径: %s\n", arrow);
+
+				if (realpath(arrow, libpath) != NULL) {
+					//printf("Mysql OpenSSL动态库路径: %s\n", libpath);
+				} else {
+					perror("OpenSSL动态库路径 路径解析失败");
+				}
+            }
+        } else {  // 处理静态或特殊库
+            char *libname = strtok(line, " ");
+            if (libname && (strstr(libname, "libssl.so") || strstr(libname, "libcrypto.so"))) {
+                printf("检测到OpenSSL依赖: %s (可能未找到路径)\n", libname);
+            }
+        }
+    }
+
+    pclose(fp);
+}
+
+int find_mysql_openssl_path(char* libpath, int len){
+	int port = 3306;
+    pid_t pid = find_pid_by_port(port);
+    if (pid == -1) {
+        printf("No process found listening on port %d.\n", port);
+        return 1;
+    }
+
+    char *process_path = get_process_path(pid);
+	if (process_path == NULL) {
+		printf("Failed to get process path for PID %d.\n", pid);
+		return 1;
+	}
+
+    //printf("Process PID: %d\n", pid);
+	//printf("Process Path: %s\n", process_path);
+
+	find_openssl_libs(process_path, libpath, len);
+
+	free(process_path);
+
+	return 0;
+}
+
 void buf_to_hex(const uint8_t *buf, size_t len, char *hex_str) {
 	for (size_t i = 0; i < len; i++) {
 		sprintf(hex_str + 2 * i, "%02x", buf[i]);
@@ -358,6 +553,30 @@ const char* int_to_ip_v1(uint32_t ip_int) {
     return inet_ntoa(addr);
 }
 
+void hexdump(const unsigned char *data, size_t len) {
+    for (size_t i = 0; i < len; i += 16) {  // 每行处理16字节
+        // 输出十六进制部分
+        for (int j = 0; j < 16; j++) {
+            if (i + j < len) {
+                printf("%02X ", data[i + j]);  // 两位十六进制 + 空格
+            } else {
+                printf("   ");  // 不足16字节用空格填充对齐
+            }
+        }
+        printf("| ");  // 分隔符
+        
+        // 输出ASCII字符部分
+        for (int j = 0; j < 16; j++) {
+            if (i + j < len) {
+                unsigned char c = data[i + j];
+                putchar(isprint(c) ? c : '.');  // 不可见字符替换为.
+            } else {
+                putchar(' ');  // 填充空格保持对齐
+            }
+        }
+        printf("\n");
+    }
+}
 // Function to print the event from the perf buffer
 void print_event(struct probe_SSL_data_t *event, const char *evt) {
 	static unsigned long long start =
@@ -454,7 +673,10 @@ void print_event(struct probe_SSL_data_t *event, const char *evt) {
 			}
 			printf("%s\n\n", e_mark);
 		} else {
-			printf("\n%s\n%s\n%s\n\n", s_mark, buf, e_mark);
+			//printf("\n%s\n%s\n%s\n\n", s_mark, buf, e_mark);
+			printf("\n%s\n", s_mark);
+			hexdump((const unsigned char*)buf, buf_size);
+			printf("\n%s\n\n", e_mark);
 		}
 	}
 }
@@ -510,6 +732,19 @@ int main(int argc, char **argv) {
 		char *nss_path = find_library_path("libnspr4.so");
 		printf("NSS path: %s\n", nss_path);
 		attach_nss(obj, nss_path);
+	}
+
+	if(env.mysql){
+		// mysql openssl path
+		//const char* mysql_openssl_path = "/usr/local/mysql/lib/private/libssl.so.3";
+		//printf("MySQL OpenSSL path: %s\n", mysql_openssl_path);
+		char mysql_openssl_path[512] = {0};
+		if(find_mysql_openssl_path(mysql_openssl_path, sizeof(mysql_openssl_path))){
+			printf("Failed to find mysql openssl path\n");
+		}
+
+		printf("Mysql OpenSSL path: %s\n", mysql_openssl_path);
+		attach_mysql_openssl(obj, mysql_openssl_path);
 	}
 
 	// glibc accept
